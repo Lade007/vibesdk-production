@@ -99,6 +99,7 @@ class CloudflareDeploymentManager {
 	private cloudflare: Cloudflare;
 	private aiGatewayCloudflare?: Cloudflare; // Separate SDK instance for AI Gateway operations
 	private conflictingVarsForCleanup: Record<string, string> | null = null; // For signal cleanup
+	private scopedTokenId: string | null = null; // To store the ID of the temporary token
 
 	constructor() {
 		this.validateEnvironment();
@@ -132,6 +133,11 @@ class CloudflareDeploymentManager {
 					);
 				} else {
 					console.log('ℹ️  No configuration changes to restore');
+				}
+
+				// Revoke the scoped token if it was created
+				if (this.scopedTokenId) {
+					await this.revokeScopedToken();
 				}
 			} catch (error) {
 				console.error(
@@ -2100,6 +2106,124 @@ class CloudflareDeploymentManager {
 	}
 
 	/**
+	 * Creates a temporary, scoped API token for the deployment
+	 */
+	private async createScopedToken(): Promise<string> {
+		console.log(
+			'🔑 Creating a temporary scoped API token for deployment...',
+		);
+
+		try {
+			// Create API token with all permissions required for deployment
+			const tokenResponse = await fetch(
+				`https://api.cloudflare.com/client/v4/user/tokens`,
+				{
+					method: 'POST',
+					headers: {
+						Authorization: `Bearer ${this.env.CLOUDFLARE_API_TOKEN}`,
+						'Content-Type': 'application/json',
+					},
+					body: JSON.stringify({
+						name: `Orange Build Deployment Token - ${new Date().toISOString()}`,
+						policies: [
+							{
+								effect: 'allow',
+								resources: {
+									[`com.cloudflare.api.account.${this.env.CLOUDFLARE_ACCOUNT_ID}`]:
+										'*',
+								},
+								permission_groups: [
+									// Full access for deployment
+									{ name: 'Account All' },
+								],
+							},
+						],
+						condition: {
+							request_ip: { in: [], not_in: [] },
+						},
+						expires_on: new Date(
+							Date.now() + 30 * 60 * 1000,
+						).toISOString(), // 30 minutes
+					}),
+				},
+			);
+
+			if (!tokenResponse.ok) {
+				const errorData = await tokenResponse.json().catch(() => ({}));
+				throw new Error(
+					`API token creation failed: ${errorData.errors?.[0]?.message || tokenResponse.statusText}`,
+				);
+			}
+
+			const tokenData = await tokenResponse.json();
+
+			if (tokenData.success && tokenData.result?.value) {
+				const newToken = tokenData.result.value;
+				console.log(
+					'✅ Temporary scoped API token created successfully',
+				);
+				this.scopedTokenId = tokenData.result.id; // Store the token ID for revocation
+				return newToken;
+			} else {
+				throw new Error(
+					'Token creation succeeded but no token value returned',
+				);
+			}
+		} catch (error) {
+			console.error(
+				`❌ Failed to create scoped API token: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			throw new DeploymentError(
+				'Failed to create scoped API token',
+				error instanceof Error ? error : new Error(String(error)),
+			);
+		}
+	}
+
+	/**
+	 * Revokes the temporary scoped API token
+	 */
+	private async revokeScopedToken(): Promise<void> {
+		if (!this.scopedTokenId) {
+			return;
+		}
+
+		console.log(
+			`🗑️ Revoking temporary deployment token (ID: ${this.scopedTokenId})...`,
+		);
+		try {
+			const response = await fetch(
+				`https://api.cloudflare.com/client/v4/user/tokens/${this.scopedTokenId}`,
+				{
+					method: 'DELETE',
+					headers: {
+						Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}`, // Use original token to revoke
+						'Content-Type': 'application/json',
+					},
+				},
+			);
+
+			if (!response.ok) {
+				const errorData = await response.json().catch(() => ({}));
+				throw new Error(
+					`API request failed with status ${response.status}: ${errorData.errors?.[0]?.message || 'Unknown error'}`,
+				);
+			}
+
+			console.log('✅ Temporary deployment token revoked successfully.');
+		} catch (error) {
+			console.warn(
+				`⚠️  Failed to revoke temporary token: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			console.warn(
+				'   Please consider revoking it manually in the Cloudflare dashboard.',
+			);
+		} finally {
+			this.scopedTokenId = null;
+		}
+	}
+
+	/**
 	 * Main deployment orchestration method
 	 */
 	public async deploy(): Promise<void> {
@@ -2111,6 +2235,12 @@ class CloudflareDeploymentManager {
 		let customDomain: string | null = null;
 
 		try {
+			// Step 0: Create a scoped token for this deployment
+			console.log('\n📋 Step 0: Creating a scoped deployment token...');
+			const scopedToken = await this.createScopedToken();
+			this.env.CLOUDFLARE_API_TOKEN = scopedToken; // Use the new token for all subsequent operations
+			this.cloudflare = new Cloudflare({ apiToken: scopedToken }); // Re-initialize the SDK
+
 			// Step 1: Early Configuration Updates (must happen before any wrangler commands)
 			this.cleanWranglerCache();
 			console.log('\n📋 Step 1: Updating configuration files...');
@@ -2209,10 +2339,14 @@ class CloudflareDeploymentManager {
 
 				// Clear the backup since we've restored
 				this.conflictingVarsForCleanup = null;
+
+				// Step 8: Revoke the temporary token
+				console.log('\n📋 Step 8: Cleaning up deployment token...');
+				await this.revokeScopedToken();
 			}
 
-			// Step 8: Run database migrations
-			console.log('\n📋 Step 8: Running database migrations...');
+			// Step 9: Run database migrations
+			console.log('\n📋 Step 9: Running database migrations...');
 			await this.runDatabaseMigrations();
 
 			// Deployment complete
@@ -2256,6 +2390,11 @@ class CloudflareDeploymentManager {
 				'   - Check that bun is installed and build script works',
 			);
 
+			// Ensure token is revoked even on failure
+			if (this.scopedTokenId) {
+				await this.revokeScopedToken();
+			}
+
 			process.exit(1);
 		}
 	}
@@ -2263,9 +2402,21 @@ class CloudflareDeploymentManager {
 
 // Main execution
 if (import.meta.url === `file://${process.argv[1]}`) {
-	const deployer = new CloudflareDeploymentManager();
-	deployer.deploy().catch((error) => {
-		console.error('Unexpected error:', error);
+	async function main() {
+		let manager: CloudflareDeploymentManager | null = null;
+		try {
+			manager = new CloudflareDeploymentManager();
+			await manager.deploy();
+		} catch (error) {
+			console.error(
+				`\n❌ An unexpected error occurred: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			// The finally block will handle cleanup
+		}
+	}
+
+	main().catch((e) => {
+		console.error('Critical error in main execution:', e);
 		process.exit(1);
 	});
 }
