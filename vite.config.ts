@@ -14,7 +14,9 @@ export default defineConfig({
 		exclude: ['format', 'editor.all'],
 		include: ['monaco-editor/esm/vs/editor/editor.api'],
 		force: true, // Force re-optimization on every start
-		rollupOptions: { ... }
+		rollupOptions: {
+			// Add your Rollup options here
+		},
 	},
 
 	// build: {
@@ -56,8 +58,8 @@ export default defineConfig({
 			debug: 'debug/src/browser',
 			// "@": path.resolve(__dirname, "./src"),
 			'@': path.resolve(__dirname, './src'),
-            'shared': path.resolve(__dirname, './shared'),
-            'worker': path.resolve(__dirname, './worker'),
+			shared: path.resolve(__dirname, './shared'),
+			worker: path.resolve(__dirname, './worker'),
 		},
 	},
 
