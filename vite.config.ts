@@ -10,24 +10,6 @@ import tailwindcss from '@tailwindcss/vite';
 
 // https://vite.dev/config/
 export default defineConfig({
-	optimizeDeps: {
-		exclude: ['format', 'editor.all'],
-		include: ['monaco-editor/esm/vs/editor/editor.api'],
-		force: true, // Force re-optimization on every start
-		rollupOptions: {
-			// Add your Rollup options here
-		},
-	},
-
-	// build: {
-	//     rollupOptions: {
-	//       output: {
-	//             advancedChunks: {
-	//                 groups: [{name: 'vendor', test: /node_modules/}]
-	//             }
-	//         }
-	//     }
-	// },
 	plugins: [
 		react(),
 		svgr(),
